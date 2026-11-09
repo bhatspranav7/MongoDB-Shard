@@ -1,0 +1,50 @@
+# Sharded MongoDB cluster for the exchange.
+#
+#   mongos (27017)  ──►  configsvr RS (cfgrs)
+#        │
+#        ├──► shard1 RS (rs1)   zone "A-M"  symbols A..M
+#        └──► shard2 RS (rs2)   zone "N-Z"  symbols N..Z
+#
+# Every replica set is single-node here (enough for a demo; replication +
+# transactions still work because it IS a replica set, just with 1 member).
+
+services:
+  cfg1:
+    image: mongo:7
+    command: mongod --configsvr --replSet cfgrs --port 27019 --bind_ip_all
+    volumes: [cfg1:/data/db]
+    healthcheck: &hc
+      test: ["CMD", "mongosh", "--port", "27019", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  shard1:
+    image: mongo:7
+    command: mongod --shardsvr --replSet rs1 --port 27018 --bind_ip_all
+    volumes: [shard1:/data/db]
+    healthcheck:
+      <<: *hc
+      test: ["CMD", "mongosh", "--port", "27018", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+
+  shard2:
+    image: mongo:7
+    command: mongod --shardsvr --replSet rs2 --port 27018 --bind_ip_all
+    volumes: [shard2:/data/db]
+    healthcheck:
+      <<: *hc
+      test: ["CMD", "mongosh", "--port", "27018", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+
+  mongos:
+    image: mongo:7
+    command: mongos --configdb cfgrs/cfg1:27019 --port 27017 --bind_ip_all
+    ports: ["27017:27017"]
+    depends_on:
+      cfg1: { condition: service_healthy }
+      shard1: { condition: service_healthy }
+      shard2: { condition: service_healthy }
+
+volumes:
+  cfg1:
+  shard1:
+  shard2:

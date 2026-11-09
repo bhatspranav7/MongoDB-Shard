@@ -1,0 +1,21 @@
+{
+  "name": "mongo-exchange",
+  "version": "1.0.0",
+  "description": "Sharded real-time trading exchange on MongoDB — NoSQL mini project (team 1)",
+  "type": "module",
+  "scripts": {
+    "cluster:up": "docker compose up -d && bash scripts/init-cluster.sh",
+    "cluster:down": "docker compose down -v",
+    "setup": "node src/setup.js",
+    "start": "node src/server.js",
+    "bots": "node scripts/bots.js",
+    "report": "node scripts/shard-report.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "mongodb": "^7.0.0",
+    "ws": "^8.18.0"
+  },
+  "engines": { "node": ">=20" }
+}

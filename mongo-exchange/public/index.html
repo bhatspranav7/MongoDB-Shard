@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MongoExchange — sharded real-time trading</title>
+<style>
+  :root { --bg:#0b0f17; --panel:#121826; --line:#1f2a3d; --fg:#dbe4f3; --mut:#7f8ea8; --up:#22c55e; --dn:#ef4444; --acc:#10b981; }
+  * { box-sizing:border-box } body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.4 ui-monospace,Menlo,Consolas,monospace }
+  header { display:flex; gap:16px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line) }
+  header h1 { font-size:15px; margin:0; color:var(--acc) } header .pill { color:var(--mut) }
+  main { display:grid; grid-template-columns: 300px 1fr 320px; grid-template-rows: auto auto; gap:10px; padding:10px }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px; overflow:auto }
+  .panel h2 { font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--mut); margin:0 0 8px }
+  table { width:100%; border-collapse:collapse } td,th { padding:2px 4px; text-align:right; white-space:nowrap } th { color:var(--mut); font-weight:normal }
+  td:first-child, th:first-child { text-align:left }
+  .up { color:var(--up) } .dn { color:var(--dn) } .mut { color:var(--mut) }
+  .book { display:grid; grid-template-columns:1fr 1fr; gap:8px } .bar { position:relative } .bar i { position:absolute; top:0; bottom:0; right:0; opacity:.15 }
+  .bids .bar i { background:var(--up) } .asks .bar i { background:var(--dn) }
+  canvas { width:100%; height:260px; display:block; background:#0e1420; border-radius:6px }
+  form { display:grid; grid-template-columns:1fr 1fr; gap:6px } form select,form input,form button { width:100%; padding:6px; background:#0e1420; color:var(--fg); border:1px solid var(--line); border-radius:4px; font:inherit }
+  button.buy { background:#14532d; border-color:var(--up) } button.sell { background:#7f1d1d; border-color:var(--dn) } button:hover { filter:brightness(1.2); cursor:pointer }
+  #msg { grid-column:1/-1; min-height:18px; color:var(--mut) }
+  .sym { cursor:pointer } .sym:hover td { background:#182236 } .sym.active td { background:#1b2a44 }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 10px } .kv b { color:var(--mut); font-weight:normal }
+  .chip { display:inline-block; padding:1px 6px; border:1px solid var(--line); border-radius:10px; margin:1px; color:var(--mut) }
+  .chip.rs1 { border-color:#3b82f6; color:#93c5fd } .chip.rs2 { border-color:#f59e0b; color:#fcd34d }
+</style>
+</head>
+<body>
+<header>
+  <h1>⟡ MongoExchange</h1>
+  <span class="pill">sharded · transactions · change streams · time-series</span>
+  <span class="pill" id="ws">ws: connecting…</span>
+  <span class="pill" id="clock"></span>
+</header>
+<main>
+  <section class="panel" id="summary"><h2>Market (24h)</h2><table><thead><tr><th>Symbol</th><th>Last ₹</th><th>Chg%</th><th>Vol</th><th>Shard</th></tr></thead><tbody></tbody></table></section>
+
+  <section class="panel">
+    <h2>Order book — <span id="symName"></span> <span class="mut" id="spread"></span></h2>
+    <div class="book">
+      <table class="bids"><thead><tr><th>Orders</th><th>Qty</th><th>Bid ₹</th></tr></thead><tbody></tbody></table>
+      <table class="asks"><thead><tr><th>Ask ₹</th><th>Qty</th><th>Orders</th></tr></thead><tbody></tbody></table>
+    </div>
+    <h2 style="margin-top:10px">1-minute candles (from time-series ticks, $dateTrunc)</h2>
+    <canvas id="chart" width="800" height="260"></canvas>
+  </section>
+
+  <section class="panel"><h2>Trade tape</h2><table id="tape"><thead><tr><th>Time</th><th>Price ₹</th><th>Qty</th><th>Taker</th></tr></thead><tbody></tbody></table></section>
+
+  <section class="panel">
+    <h2>Place order</h2>
+    <form id="orderForm">
+      <select name="userId" id="userSel"></select>
+      <select name="type"><option>LIMIT</option><option>MARKET</option></select>
+      <input name="price" placeholder="price ₹ (e.g. 4100.00)" />
+      <input name="qty" placeholder="qty" value="10" />
+      <button type="button" class="buy" data-side="BUY">BUY</button>
+      <button type="button" class="sell" data-side="SELL">SELL</button>
+      <div id="msg"></div>
+    </form>
+    <h2 style="margin-top:10px">Portfolio</h2>
+    <table id="pf"><tbody></tbody></table>
+    <h2 style="margin-top:10px">My open orders</h2>
+    <table id="mine"><tbody></tbody></table>
+  </section>
+
+  <section class="panel" style="grid-column:2/4">
+    <h2>Cluster — where the data physically lives</h2>
+    <div id="cluster" class="kv"></div>
+    <div id="chips" style="margin-top:6px"></div>
+    <h2 style="margin-top:10px">Transaction stats (this API process)</h2>
+    <div id="stats" class="kv"></div>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const inr = (p) => (p / 100).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const api = (p, o) => fetch('/api' + p, o).then(async r => { const j = await r.json(); if (!r.ok) throw j; return j; });
+let symbol = localStorage.getItem('sym') || 'TCS';
+let symbolShard = {};
+
+async function loadSummary() {
+  const rows = await api('/summary');
+  $('#summary tbody').innerHTML = rows.map(r => `<tr class="sym ${r.symbol===symbol?'active':''}" data-s="${r.symbol}">
+    <td>${r.symbol}</td><td>${inr(r.last)}</td><td class="${r.changePct>=0?'up':'dn'}">${r.changePct>=0?'+':''}${r.changePct}%</td>
+    <td>${r.volume}</td><td><span class="chip ${symbolShard[r.symbol]||''}">${symbolShard[r.symbol]||'?'}</span></td></tr>`).join('');
+  document.querySelectorAll('.sym').forEach(tr => tr.onclick = () => { symbol = tr.dataset.s; localStorage.setItem('sym', symbol); refreshSymbol(); loadSummary(); });
+}
+async function loadBook() {
+  const b = await api(`/book/${symbol}`);
+  $('#symName').textContent = symbol;
+  $('#spread').textContent = b.spread != null ? `spread ₹${inr(b.spread)} · bids ${b.bidVolume} / asks ${b.askVolume}` : '(empty book)';
+  const max = Math.max(1, ...b.bids.map(x => x.qty), ...b.asks.map(x => x.qty));
+  $('.bids tbody').innerHTML = b.bids.map(x => `<tr class="bar"><td>${x.orders}</td><td>${x.qty}</td><td class="up">${inr(x.price)}</td><i style="width:${x.qty/max*100}%"></i></tr>`).join('');
+  $('.asks tbody').innerHTML = b.asks.map(x => `<tr class="bar"><td class="dn" style="text-align:left">${inr(x.price)}</td><td>${x.qty}</td><td>${x.orders}</td><i style="width:${x.qty/max*100}%"></i></tr>`).join('');
+}
+async function loadTape() {
+  const t = await api(`/trades/${symbol}?limit=40`);
+  $('#tape tbody').innerHTML = t.map(tradeRow).join('');
+}
+const tradeRow = (t) => `<tr><td class="mut">${new Date(t.executedAt || t.at).toLocaleTimeString()}</td><td class="${t.takerSide==='BUY'?'up':'dn'}">${inr(t.price)}</td><td>${t.qty}</td><td>${t.takerSide}</td></tr>`;
+
+async function loadChart() {
+  const c = await api(`/candles/${symbol}?interval=1m&limit=60`);
+  const cv = $('#chart'), ctx = cv.getContext('2d'); const W = cv.width, H = cv.height; ctx.clearRect(0,0,W,H);
+  if (!c.length) { ctx.fillStyle = '#7f8ea8'; ctx.fillText('no trades yet — run `npm run bots`', 20, 30); return; }
+  const lo = Math.min(...c.map(x => x.low)), hi = Math.max(...c.map(x => x.high)), pad = (hi - lo) * .1 || 1;
+  const y = (p) => H - 20 - (p - (lo - pad)) / ((hi + pad) - (lo - pad)) * (H - 40);
+  const w = W / Math.max(c.length, 30);
+  c.forEach((k, i) => {
+    const x = i * w + w / 2, up = k.close >= k.open; ctx.strokeStyle = ctx.fillStyle = up ? '#22c55e' : '#ef4444';
+    ctx.beginPath(); ctx.moveTo(x, y(k.high)); ctx.lineTo(x, y(k.low)); ctx.stroke();
+    ctx.fillRect(x - w * .3, y(Math.max(k.open, k.close)), w * .6, Math.max(1, Math.abs(y(k.open) - y(k.close))));
+  });
+  ctx.fillStyle = '#7f8ea8'; ctx.fillText(`₹${inr(hi)}`, 4, 12); ctx.fillText(`₹${inr(lo)}`, 4, H - 6);
+  ctx.fillText(`VWAP last: ₹${inr(c.at(-1).vwap)}  vol: ${c.at(-1).volume}`, W - 230, 12);
+}
+async function loadUsers() {
+  const u = await api('/users'); $('#userSel').innerHTML = u.map(x => `<option value="${x._id}">${x.name}</option>`).join('');
+  $('#userSel').value = localStorage.getItem('uid') || u[0]._id; $('#userSel').onchange = () => { localStorage.setItem('uid', $('#userSel').value); loadPortfolio(); };
+}
+async function loadPortfolio() {
+  const id = $('#userSel').value; if (!id) return;
+  const p = await api(`/users/${id}`);
+  $('#pf tbody').innerHTML = `<tr><th>Net worth</th><td>₹${inr(p.netWorthInr)}</td><td></td></tr>` +
+    p.positions.filter(x => x.total).map(x => `<tr><td>${x.asset}</td><td>${x.asset==='INR'?'₹'+inr(x.available):x.available}</td><td class="mut">locked ${x.asset==='INR'?'₹'+inr(x.locked):x.locked}</td></tr>`).join('');
+  const o = await api(`/users/${id}/orders`);
+  $('#mine tbody').innerHTML = o.filter(x => x.status === 'OPEN').slice(0, 8).map(x =>
+    `<tr><td>${x.symbol} ${x.side}</td><td>${x.remaining}/${x.qty} @ ₹${inr(x.price)}</td><td><button onclick="cancel('${x._id}')">✕</button></td></tr>`).join('') || '<tr><td class="mut">none</td></tr>';
+}
+window.cancel = async (id) => { try { await api(`/orders/${id}?userId=${$('#userSel').value}`, { method: 'DELETE' }); loadPortfolio(); } catch (e) { $('#msg').textContent = e.message; } };
+
+document.querySelectorAll('#orderForm button').forEach(b => b.onclick = async () => {
+  const f = new FormData($('#orderForm'));
+  const body = { userId: f.get('userId'), symbol, side: b.dataset.side, type: f.get('type'), qty: Number(f.get('qty')),
+                 price: f.get('type') === 'LIMIT' ? Math.round(parseFloat(f.get('price')) * 100) : undefined };
+  try {
+    const r = await api('/orders', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    $('#msg').textContent = `✔ ${r.order.status} · ${r.trades.length} fill(s) · ${r.attempts} txn attempt(s)`;
+    loadPortfolio();
+  } catch (e) { $('#msg').textContent = `✖ ${e.error}: ${e.message}`; }
+});
+
+async function loadCluster() {
+  const [c, s] = await Promise.all([api('/admin/shards'), api('/admin/stats')]);
+  symbolShard = c.symbolShard;
+  $('#cluster').innerHTML = c.shards.map(sh => `<b>${sh.id}</b><span>${sh.host} · zones [${sh.zones.join(', ')}]</span>`).join('') +
+    Object.entries(c.collections).map(([n, v]) => `<b>${n}</b><span>key ${JSON.stringify(v.shardKey)} → ${v.perShard.map(p => `${p.shard}: ${p.chunks} chunk(s)${p.docs!=null?`, ${p.docs} docs`:''}`).join(' | ')}</span>`).join('');
+  $('#chips').innerHTML = Object.entries(c.symbolShard).map(([k, v]) => `<span class="chip ${v}">${k} → ${v}</span>`).join('');
+  $('#stats').innerHTML = Object.entries(s).map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join('');
+}
+
+function refreshSymbol() { loadBook(); loadTape(); loadChart(); }
+let chartTimer;
+function connectWS() {
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+  ws.onopen = () => $('#ws').textContent = 'ws: live ●';
+  ws.onclose = () => { $('#ws').textContent = 'ws: reconnecting…'; setTimeout(connectWS, 1000); };
+  ws.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.type === 'book' && m.symbol === symbol) loadBook();
+    if (m.type === 'trade' && m.symbol === symbol) {
+      $('#tape tbody').insertAdjacentHTML('afterbegin', tradeRow(m));
+      if ($('#tape tbody').children.length > 40) $('#tape tbody').lastElementChild.remove();
+      clearTimeout(chartTimer); chartTimer = setTimeout(loadChart, 500);
+    }
+  };
+}
+(async () => {
+  await loadCluster(); await loadUsers(); await loadSummary(); refreshSymbol(); loadPortfolio(); connectWS();
+  setInterval(loadSummary, 5000); setInterval(loadCluster, 5000); setInterval(loadPortfolio, 5000);
+  setInterval(() => $('#clock').textContent = new Date().toLocaleTimeString(), 1000);
+})();
+</script>
+</body>
+</html>
